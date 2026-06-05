@@ -722,7 +722,6 @@ class MetalModelRunner:
 
     def _prefill_single(
         self,
-        req_id: str,
         token_ids: list[int],
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
@@ -730,7 +729,6 @@ class MetalModelRunner:
         """Process a single prefill request.
 
         Args:
-            req_id: Request ID
             token_ids: Prompt token IDs
             sampling_params: Sampling parameters for this request
 
@@ -1801,7 +1799,6 @@ class MetalModelRunner:
                 continue
 
             next_token, cache, logprobs = self._prefill_single(
-                req_id,
                 token_ids,
                 sampling_params,
                 generator=generator,
