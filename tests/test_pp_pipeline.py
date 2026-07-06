@@ -8,6 +8,7 @@ tiny stub backbone whose ``.layers`` is a list of sentinels.
 
 from types import SimpleNamespace
 
+import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
@@ -138,6 +139,13 @@ class TestApplyPipelineSplit:
         with pytest.raises(TypeError, match="sliceable list"):
             apply_pipeline_split(model, _pp(0, 2))
 
+    def test_more_stages_than_layers_fails_loud(self) -> None:
+        # 2 layers / 3 stages: get_pp_indices gives rank 2 an empty [2, 2) span, so
+        # the split fails loud rather than the wire descriptor later reading
+        # layers[0] on an empty stage.
+        with pytest.raises(NotImplementedError, match="leaves stage 2 with no layers"):
+            apply_pipeline_split(_make_model(2), _pp(2, 3))
+
 
 class TestRingHosts:
     def test_single_node_distinct_ports(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,15 +180,29 @@ class TestRingHosts:
             _ring_hosts(["10.0.0.5", "10.0.0.6"])
 
 
+class _StubLayer(nn.Module):
+    """An owned PP layer with the quantized projection registered BEFORE the norm,
+    mirroring real Llama/Qwen blocks (attention precedes norms). The packed weight
+    is uint32; the norm uses a DISTINCT float dtype so the wire-descriptor test
+    proves the uint32 weight is skipped and the floating quant scales (seen first)
+    are chosen — not the later norm."""
+
+    def __init__(self, hidden: int) -> None:
+        super().__init__()
+        self.q_proj = nn.QuantizedLinear(hidden, hidden, group_size=32, bits=4)
+        self.input_layernorm = nn.RMSNorm(hidden)
+        self.input_layernorm.weight = self.input_layernorm.weight.astype(mx.float16)
+
+
 class TestPipelinedModel:
     def test_singleton_runs_full_model_without_recv(self) -> None:
         # size-1 group: is_first and is_last are both true, so the wrapper runs
         # the full model (no recv) and passes input_embeddings=None — the model
-        # embeds the tokens itself.
+        # embeds the tokens itself. The wire descriptor is never read for a
+        # singleton, so the stub needs nothing beyond __call__.
         class _Stub:
             def __init__(self) -> None:
                 self.input_embeddings: object = "unset"
-                self.model = SimpleNamespace(embed_tokens=nn.Embedding(4, 8))
 
             def __call__(self, input_ids, *, cache=None, input_embeddings=None):
                 self.input_embeddings = input_embeddings
@@ -191,16 +213,22 @@ class TestPipelinedModel:
         assert out == "logits"
         assert stub.input_embeddings is None
 
-    def test_wire_descriptor_from_embedding_output(self) -> None:
-        # The wire descriptor must come from the embedding *output*: a quantized
-        # checkpoint packs the weight (uint32, hidden folded by the bit width),
-        # so weight.shape[-1] / weight.dtype would declare a wrong recv and
-        # deadlock the ring.
-        embed = nn.QuantizedEmbedding(64, 32, group_size=32, bits=4)
-        assert embed.weight.shape[-1] != 32  # really packed
-        model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
+    def test_wire_descriptor_skips_packed_quant_weight(self) -> None:
+        # hidden from config; dtype from the first FLOATING param of the first owned
+        # layer, NOT by probing embed_tokens (a streaming non-first stage does not
+        # own it). The quantized projection is registered first, so its packed
+        # uint32 weight must be SKIPPED and its floating scales chosen — proven by
+        # the dtype being the scales' and NOT the (distinct) norm's.
+        layer = _StubLayer(32)
+        assert layer.q_proj.weight.dtype == mx.uint32  # packed, must be skipped
+        assert layer.q_proj.scales.dtype != layer.input_layernorm.weight.dtype
+        model = SimpleNamespace(
+            args=SimpleNamespace(hidden_size=32),
+            model=SimpleNamespace(layers=[layer]),  # no embed_tokens: not probed
+        )
 
-        wrapper = PipelinedModel(model, _pp(0, 2))
+        wrapper = PipelinedModel(model, _pp(1, 2))  # a non-first stage
 
         assert wrapper._wire_hidden == 32
-        assert wrapper._wire_dtype == embed.scales.dtype
+        assert wrapper._wire_dtype == layer.q_proj.scales.dtype
+        assert wrapper._wire_dtype != layer.input_layernorm.weight.dtype

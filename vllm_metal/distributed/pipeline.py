@@ -20,12 +20,14 @@ import json
 import logging
 import os
 import tempfile
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.core.distributed import Group
+from mlx.utils import tree_flatten
 from vllm.distributed.utils import get_pp_indices
 
 import vllm_metal.envs as envs
@@ -171,6 +173,13 @@ def apply_pipeline_split(model: nn.Module, pp: PipelineGroup) -> tuple[int, int]
         )
 
     start, end = get_pp_indices(len(layers), pp.rank, pp.size)
+    if start >= end:
+        raise NotImplementedError(
+            f"Pipeline parallelism with {pp.size} stages over a model with "
+            f"{len(layers)} layers leaves stage {pp.rank} with no layers "
+            f"(get_pp_indices returned [{start}, {end})); use at most "
+            f"{len(layers)} pipeline stages."
+        )
     backbone.layers = layers[start:end]
 
     if not pp.is_last:
@@ -236,14 +245,25 @@ class PipelinedModel:
     def __init__(self, model: Any, pp: PipelineGroup) -> None:
         self._model = model
         self._pp = pp
-        # Wire descriptor: (hidden, dtype) of the activation that crosses
-        # stages, taken from the embedding *output*. The embedding weight is
-        # the wrong source: quantized checkpoints pack it (uint32, hidden
-        # folded by the bit width). Shape/dtype inference is lazy — nothing is
-        # evaluated here.
-        probe = model.model.embed_tokens(mx.array([0]))
-        self._wire_hidden: int = probe.shape[-1]
-        self._wire_dtype: mx.Dtype = probe.dtype
+
+    # Wire descriptor: (hidden, dtype) of the activation that crosses stages, read
+    # from state every stage owns (config width + a stage-owned compute parameter),
+    # not by probing ``embed_tokens`` which a streaming non-first stage does not
+    # own. Lazy: a singleton stage crosses no wire, so it never reads either half.
+    @cached_property
+    def _wire_hidden(self) -> int:
+        return self._model.args.hidden_size
+
+    @cached_property
+    def _wire_dtype(self) -> mx.Dtype:
+        # First floating-point parameter of the first owned layer: norm weights and
+        # quant scales are floating, a packed quantized weight is uint32. tree_flatten
+        # is typed list|dict, so pin the list branch for mypy.
+        first_layer = self._model.model.layers[0]
+        flat: list[tuple[str, Any]] = tree_flatten(first_layer.parameters())
+        return next(
+            param.dtype for _, param in flat if mx.issubdtype(param.dtype, mx.floating)
+        )
 
     def __call__(self, input_ids: mx.array, *, cache: Any = None) -> mx.array:
         pp = self._pp
@@ -262,7 +282,7 @@ class PipelinedModel:
         if h_out.dtype != self._wire_dtype:
             raise TypeError(
                 f"PP stage produced hidden {h_out.dtype}, but the wire dtype "
-                f"(embedding output dtype) is {self._wire_dtype}; mismatch "
+                f"(stage compute dtype) is {self._wire_dtype}; mismatch "
                 f"deadlocks the ring."
             )
         return h_out
