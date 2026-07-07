@@ -12,7 +12,12 @@ from mlx.utils import tree_unflatten
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import is_in_target_modules
 
-from .layers import MLXLinearWithLoRA, can_wrap
+from .layers import (
+    MLXLinearWithLoRA,
+    MLXQuantizedLinearWithLoRA,
+    can_wrap,
+    can_wrap_qlora,
+)
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX
 from .punica_wrapper import PunicaWrapperMLX
 
@@ -21,8 +26,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_WrappedModule = MLXLinearWithLoRA | MLXQuantizedLinearWithLoRA
 _PreparedLoRAWeights = tuple[mx.array, mx.array]
-_PreparedModuleUpdate = tuple[MLXLinearWithLoRA, _PreparedLoRAWeights | None]
+_PreparedModuleUpdate = tuple[_WrappedModule, _PreparedLoRAWeights | None]
 
 
 class _PreparedAdapterUpdate(NamedTuple):
@@ -49,7 +55,7 @@ class MLXLoRAModelManager:
         self._registered: dict[int, LoadedLoRA] = {}
         self.lora_index_to_id: list[int | None] = [None] * self.lora_slots
 
-        self.modules: dict[str, MLXLinearWithLoRA] = {}
+        self.modules: dict[str, _WrappedModule] = {}
         self.punica_wrapper = PunicaWrapperMLX(
             max_num_batched_tokens, max_num_seqs, self.lora_slots
         )
@@ -69,28 +75,51 @@ class MLXLoRAModelManager:
 
     def _wrap_target_modules(self) -> None:
         targets = self.lora_config.target_modules
-        repls = [
-            (
-                name,
-                MLXLinearWithLoRA(
-                    m, self.lora_slots, self.lora_config.max_lora_rank, self.dtype
-                ),
-            )
-            for name, m in self.model.named_modules()
-            if can_wrap(m) and is_in_target_modules(name, targets)
-        ]
+        repls: list[tuple[str, _WrappedModule]] = []
+        for name, m in self.model.named_modules():
+            if not is_in_target_modules(name, targets):
+                continue
+            if can_wrap(m):
+                repls.append(
+                    (
+                        name,
+                        MLXLinearWithLoRA(
+                            m,
+                            self.lora_slots,
+                            self.lora_config.max_lora_rank,
+                            self.dtype,
+                        ),
+                    )
+                )
+            elif can_wrap_qlora(m):
+                repls.append(
+                    (
+                        name,
+                        MLXQuantizedLinearWithLoRA(
+                            m,
+                            self.lora_slots,
+                            self.lora_config.max_lora_rank,
+                            self.dtype,
+                        ),
+                    )
+                )
         if not repls:
             raise RuntimeError(
                 "MLXLoRAModelManager found no LoRA target modules to wrap. "
-                "The model may expose only quantized layers, which v1 LoRA "
-                "does not support yet, or LoRAConfig.target_modules may "
-                "exclude every wrappable nn.Linear."
+                "LoRAConfig.target_modules may exclude every wrappable module, "
+                "or the selected leaves may not expose a supported linear "
+                "contract for LoRA/QLoRA wrapping."
             )
         for name, w in repls:
             w.set_mapping(self.punica_wrapper)
             self.modules[name] = w
         self.model.update_modules(tree_unflatten(repls))
-        logger.info("MLXLoRAModelManager wrapped %d Linear modules.", len(repls))
+        logger.info(
+            "MLXLoRAModelManager wrapped %d modules (%d plain, %d quantized).",
+            len(repls),
+            sum(1 for _, w in repls if isinstance(w, MLXLinearWithLoRA)),
+            sum(1 for _, w in repls if isinstance(w, MLXQuantizedLinearWithLoRA)),
+        )
 
     def add_adapter(self, adapter: LoadedLoRA) -> bool:
         if adapter.lora_id in self._registered:
