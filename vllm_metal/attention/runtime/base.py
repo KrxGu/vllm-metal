@@ -60,7 +60,7 @@ class PagedAttentionRuntimeBase:
         del outputs
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Release any runtime-owned state for finished requests."""
+        """Release runtime-owned state for requests whose state is invalid."""
         del req_ids
 
     def materialize_pending_state(self) -> None:

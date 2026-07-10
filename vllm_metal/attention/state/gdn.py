@@ -4,7 +4,7 @@
 The hybrid paged runtime owns two different state systems:
 
 - SDPA KV cache, indexed by scheduler block tables
-- GDN recurrent state, indexed by one stable slot per active request
+- GDN recurrent state, indexed by one stable slot per resident request
 
 `HybridGDNStateManager` owns the second one. It keeps request-to-slot
 assignment stable across request reordering, grows the recurrent cache when new
@@ -108,7 +108,7 @@ class HybridGDNStateManager:
         outputs.extend(self._state_cache.updated_state_arrays())
 
     def release_requests(self, req_ids: set[str]) -> None:
-        """Release slots for finished requests and mark state for eval."""
+        """Release slots for requests whose recurrent state is no longer valid."""
         freed_slots: list[int] = []
         for req_id in req_ids:
             slot = self._req_to_slot.pop(req_id, None)
