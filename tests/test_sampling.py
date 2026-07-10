@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Metal sampling with vLLM Sampler integration."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -11,7 +13,7 @@ from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import LogprobsLists
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -304,13 +306,17 @@ class TestV1SeededSamplingGenerator:
 
 class TestV1SamplingBatch:
     @staticmethod
-    def _batch(params_list: list[SamplingParams]) -> SamplingBatch:
+    def _batch(
+        params_list: list[SamplingParams],
+        logitsprocs: LogitsProcessors | None = None,
+    ) -> SamplingBatch:
         return SamplingBatch(
             params_list,
             [[1]] * len(params_list),
             [[]] * len(params_list),
             vocab_size=VOCAB_SIZE,
             device=torch.device("cpu"),
+            logitsprocs=logitsprocs,
         )
 
     def test_can_use_native_greedy_requires_greedy_without_filters(self) -> None:
@@ -347,62 +353,62 @@ class TestV1SamplingBatch:
         bad_sp._bad_words_token_ids = [[99]]
         assert not self._batch([bad_sp]).can_use_native_greedy()
 
-    def test_native_greedy_gates_on_builtin_logitsproc_activity(self) -> None:
-        """Always-registered MinTokens/LogitBias builtins are non-argmax-invariant,
-        but standard greedy must still take the native MLX path (they are no-ops
-        unless their params are set). Active params, or any unrecognized
-        non-argmax-invariant processor, must fall back to the vLLM sampler."""
-        from types import SimpleNamespace
-
-        from vllm.v1.sample.logits_processor import (
-            LogitsProcessors,
-            build_logitsprocs,
+    def test_native_greedy_allows_dormant_builtin_logits_processors(self) -> None:
+        vllm_config = SimpleNamespace(
+            speculative_config=None,
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
         )
+        logitsprocs = build_logitsprocs(
+            vllm_config,
+            torch.device("cpu"),
+            is_pin_memory=False,
+            is_pooling_model=False,
+        )
+        batch = self._batch([SamplingParams(temperature=0.0)], logitsprocs)
 
-        def _builtins() -> LogitsProcessors:
-            config = SimpleNamespace(
-                speculative_config=None,
-                scheduler_config=SimpleNamespace(max_num_seqs=4),
-            )
-            return build_logitsprocs(
-                config,
-                torch.device("cpu"),
-                is_pin_memory=False,
-                is_pooling_model=False,
-            )
+        assert batch.can_use_native_greedy()
 
-        def _batch(sp: SamplingParams, procs: LogitsProcessors) -> SamplingBatch:
-            return SamplingBatch(
-                [sp],
-                [[1, 2, 3]],
-                [[]],
-                vocab_size=VOCAB_SIZE,
-                device=torch.device("cpu"),
-                logitsprocs=procs,
-            )
+    @pytest.mark.parametrize(
+        ("logit_bias", "min_tokens"),
+        [
+            ({1: 5.0}, 0),
+            (None, 5),
+        ],
+        ids=["logit_bias", "min_tokens"],
+    )
+    def test_native_greedy_rejects_active_builtin_logits_processors(
+        self,
+        logit_bias: dict[int, float] | None,
+        min_tokens: int,
+    ) -> None:
+        vllm_config = SimpleNamespace(
+            speculative_config=None,
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+        )
+        logitsprocs = build_logitsprocs(
+            vllm_config,
+            torch.device("cpu"),
+            is_pin_memory=False,
+            is_pooling_model=False,
+        )
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            logit_bias=logit_bias,
+            min_tokens=min_tokens,
+        )
+        batch = self._batch([sampling_params], logitsprocs)
 
-        # Dormant builtins: native greedy still allowed despite their presence.
-        assert _batch(
-            SamplingParams(temperature=0.0), _builtins()
-        ).can_use_native_greedy()
-        # Active logit_bias must fall back so the bias is actually applied.
-        assert not _batch(
-            SamplingParams(temperature=0.0, logit_bias={1: 5.0}), _builtins()
-        ).can_use_native_greedy()
-        # Active min_tokens must fall back so EOS masking is applied.
-        assert not _batch(
-            SamplingParams(temperature=0.0, min_tokens=5), _builtins()
-        ).can_use_native_greedy()
+        assert not batch.can_use_native_greedy()
 
-        # An unrecognized non-argmax-invariant processor forces the safe path.
+    def test_native_greedy_rejects_unknown_non_argmax_processor(self) -> None:
         class _UnknownNonArgmax:
             def is_argmax_invariant(self) -> bool:
                 return False
 
-        assert not _batch(
-            SamplingParams(temperature=0.0),
-            LogitsProcessors([_UnknownNonArgmax()]),
-        ).can_use_native_greedy()
+        logitsprocs = LogitsProcessors([_UnknownNonArgmax()])
+        batch = self._batch([SamplingParams(temperature=0.0)], logitsprocs)
+
+        assert not batch.can_use_native_greedy()
 
     def test_allowed_token_ids_constrains_greedy_sampling(self) -> None:
         """Greedy with allowed_token_ids must fall back and the constraint works."""
