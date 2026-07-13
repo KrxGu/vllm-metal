@@ -397,15 +397,17 @@ class MetalPlatform(Platform):
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
 
-        if (
-            model_config is not None
-            and model_config.is_hybrid
-            and vllm_config.cache_config.enable_prefix_caching
-        ):
-            raise NotImplementedError(
-                "Prefix caching is not supported for hybrid GDN models on Metal "
-                "because GDN recurrent state cannot be restored from KV blocks."
-            )
+        if model_config is not None and model_config.is_hybrid:
+            cache_config = vllm_config.cache_config
+            if (
+                cache_config.enable_prefix_caching
+                or cache_config.mamba_cache_mode != "none"
+            ):
+                raise NotImplementedError(
+                    "Prefix caching and Mamba cache modes are not supported for "
+                    "hybrid GDN models on Metal because GDN recurrent state cannot "
+                    "be restored from KV blocks."
+                )
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the
@@ -757,7 +759,109 @@ class MetalPlatform(Platform):
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
         # layer (``_pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
+        cache_config = vllm_config.cache_config
+        user_block_size = (
+            cache_config.block_size if cache_config.user_specified_block_size else None
+        )
+        hash_block_size = cache_config.hash_block_size
         super().update_block_size_for_backend(vllm_config)
+
+        cls._realign_hybrid_block_size_for_turboquant(
+            vllm_config,
+            user_block_size=user_block_size,
+            hash_block_size=hash_block_size,
+        )
+
+    @classmethod
+    def _realign_hybrid_block_size_for_turboquant(
+        cls,
+        vllm_config: "VllmConfig",
+        *,
+        user_block_size: int | None,
+        hash_block_size: int | None,
+    ) -> None:
+        """Redo hybrid alignment with TurboQuant's packed SDPA page size."""
+        metal_config = get_config()
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+
+        turboquant = metal_config.turboquant
+        k_quant = metal_config.k_quant
+        v_quant = metal_config.v_quant
+
+        if (
+            not turboquant
+            or not metal_config.use_paged_attention
+            or not model_config
+            or not model_config.is_hybrid
+        ):
+            return
+
+        from math import lcm
+
+        from vllm.model_executor.models import ModelRegistry
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.attention.backend import MultipleOf
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        from vllm_metal.v1.cache_policy import turboquant_page_size_bytes
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            model_config.architecture,
+            model_config=model_config,
+        )
+        mamba_page_size = MambaSpec(
+            shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+            dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+            block_size=-1,
+        ).page_size_bytes
+        if mamba_page_size == 0:
+            return
+
+        tq_page_size_1_token = turboquant_page_size_bytes(
+            block_size=1,
+            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+            head_dim=model_config.get_head_size(),
+            k_quant=k_quant,
+            v_quant=v_quant,
+        )
+
+        backend_cls = cls._find_non_ssm_backend(vllm_config)
+        assert backend_cls is not None
+        backend_block_alignment_size = min(
+            s.base if isinstance(s, MultipleOf) else s
+            for s in backend_cls.get_supported_kernel_block_sizes()
+        )
+        kernel_block_alignment_size = lcm(
+            backend_block_alignment_size,
+            user_block_size or 1,
+            hash_block_size or 1,
+        )
+
+        attn_block_size = kernel_block_alignment_size * cdiv(
+            mamba_page_size,
+            kernel_block_alignment_size * tq_page_size_1_token,
+        )
+
+        if cache_config.block_size < attn_block_size:
+            logger.info(
+                "TurboQuant hybrid alignment: attention block size %s -> %d "
+                "tokens so the packed attention page (%d B/token) still "
+                "covers the mamba page (%d B).",
+                cache_config.block_size,
+                attn_block_size,
+                tq_page_size_1_token,
+                mamba_page_size,
+            )
+            cache_config.block_size = attn_block_size
+
+        # Pad mamba page size to exactly match the packed attention page.
+        attn_page_size = cache_config.block_size * tq_page_size_1_token
+        assert attn_page_size >= mamba_page_size
+        if attn_page_size == mamba_page_size:
+            cache_config.mamba_page_size_padded = None
+            return
+        cache_config.mamba_page_size_padded = attn_page_size
 
     @classmethod
     def get_attn_backend_cls(

@@ -67,7 +67,7 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        return _turboquant_page_size_bytes(
+        return turboquant_page_size_bytes(
             block_size=self.block_size,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_size,
@@ -77,10 +77,11 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
 
     @classmethod
     def merge(cls, specs: Sequence[FullAttentionSpec]) -> TurboQuantAttentionSpec:
+        # vLLM's uniformity probe treats AssertionError as "mixed spec type".
         turbo_specs: list[TurboQuantAttentionSpec] = []
         for spec in specs:
             if not isinstance(spec, TurboQuantAttentionSpec):
-                raise TypeError(
+                raise AssertionError(
                     "All attention layers in the same KV cache group must be "
                     "TurboQuantAttentionSpec."
                 )
@@ -118,7 +119,7 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         )
 
 
-def _turboquant_page_size_bytes(
+def turboquant_page_size_bytes(
     block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
 ) -> int:
     """Calculate TurboQuant-compressed page size for one layer."""
@@ -331,7 +332,7 @@ class ModelCachePolicy:
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
         if self._use_turboquant(config):
-            return num_kv_layers * _turboquant_page_size_bytes(
+            return num_kv_layers * turboquant_page_size_bytes(
                 block_size=block_size,
                 num_kv_heads=self._runner.num_kv_heads,
                 head_dim=self._runner.head_dim,
@@ -408,9 +409,7 @@ class ModelCachePolicy:
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
         if self._use_turboquant(config):
-            # _turboquant_page_size_bytes is parameterised by tokens (block_size);
-            # pass aligned_tokens to get the per-sequence byte total directly.
-            return num_kv_layers * _turboquant_page_size_bytes(
+            return num_kv_layers * turboquant_page_size_bytes(
                 block_size=aligned_tokens,
                 num_kv_heads=self._runner.num_kv_heads,
                 head_dim=self._runner.head_dim,
@@ -542,9 +541,11 @@ class ModelCachePolicy:
         return self._runner.num_kv_cache_layers
 
     def _use_turboquant(self, config: MetalConfig) -> bool:
-        return bool(
-            config.turboquant and not self._runner.is_hybrid and not self._runner.is_mla
-        )
+        # Hybrid models compress their SDPA layers too (see
+        # ``_build_hybrid_backend``), so they must not be excluded here:
+        # every scheduler-visible sizing path (specs, per-block bytes,
+        # one-sequence estimates) has to agree with the runtime layout.
+        return bool(config.turboquant and not self._runner.is_mla)
 
     def _kv_factor(self) -> int:
         return 1 if self._runner.is_mla else 2
