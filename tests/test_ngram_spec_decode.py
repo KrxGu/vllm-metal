@@ -11,10 +11,12 @@ intermediate prefills) and the array marshalling into the upstream kernel.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from vllm.sampling_params import SamplingParams
 
+from vllm_metal.v1 import ngram_proposer as ngram_mod
 from vllm_metal.v1.ngram_proposer import NgramProposer
 from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
@@ -213,6 +215,104 @@ class TestNgramProposePropose:
 
         assert drafts is not None
         assert drafts.req_ids == ["r0"]
+
+
+class TestNgramMissThrottle:
+    """The kernel scans a request's whole history every step whether or not
+    it finds anything, so a request that never matches should stop being
+    handed to the kernel after enough consecutive misses -- these tests
+    mock the wrapped upstream call directly so they exercise only the
+    throttle bookkeeping, independent of the installed vLLM's kernel
+    signature."""
+
+    def test_throttles_after_max_consecutive_misses(self) -> None:
+        proposer = _proposer()
+        state = _request_state([7, 8, 9])
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        with patch.object(
+            proposer._ngram, "propose", return_value=[[]]
+        ) as mock_propose:
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
+                assert proposer.propose(ctx) is None
+            calls_before_throttle = mock_propose.call_count
+
+            # One more miss would be the (N+1)th in a row: by now the request
+            # should be on cooldown and skipped before ever reaching the kernel.
+            assert proposer.propose(ctx) is None
+            assert mock_propose.call_count == calls_before_throttle
+
+    def test_hit_resets_the_streak(self) -> None:
+        proposer = _proposer()
+        state = _request_state([7, 8, 9])
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        with patch.object(proposer._ngram, "propose") as mock_propose:
+            mock_propose.return_value = [[]]
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES - 1):
+                assert proposer.propose(ctx) is None
+
+            # A hit right before the threshold must reset the streak, not
+            # just delay the cutoff by one step.
+            mock_propose.return_value = [[1]]
+            assert proposer.propose(ctx) is not None
+
+            mock_propose.return_value = [[]]
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES - 1):
+                assert proposer.propose(ctx) is None
+            calls_before = mock_propose.call_count
+
+            # Still under threshold post-reset: the kernel must still be
+            # reachable, not skipped.
+            proposer.propose(ctx)
+            assert mock_propose.call_count == calls_before + 1
+
+    def test_cooldown_expires_and_retries(self) -> None:
+        proposer = _proposer()
+        state = _request_state([7, 8, 9])
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        with patch.object(
+            proposer._ngram, "propose", return_value=[[]]
+        ) as mock_propose:
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
+                proposer.propose(ctx)
+            calls_at_throttle = mock_propose.call_count
+
+            # Every call during cooldown must be skipped before the kernel.
+            for _ in range(ngram_mod._COOLDOWN_STEPS - 1):
+                proposer.propose(ctx)
+            assert mock_propose.call_count == calls_at_throttle
+
+            # The cooldown-th call is the last skipped one; the call after
+            # that must reach the kernel again.
+            proposer.propose(ctx)
+            assert mock_propose.call_count == calls_at_throttle
+            proposer.propose(ctx)
+            assert mock_propose.call_count == calls_at_throttle + 1
+
+    def test_prune_finished_clears_throttle_state(self) -> None:
+        proposer = _proposer()
+        state = _request_state([7, 8, 9])
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        with patch.object(proposer._ngram, "propose", return_value=[[]]):
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
+                proposer.propose(ctx)
+        assert "r0" in proposer._cooldown
+
+        # r0 finishes: its bookkeeping must not survive to be misread by a
+        # later, unrelated request that happens to reuse the same id.
+        proposer._prune_finished({})
+        assert "r0" not in proposer._cooldown
+        assert "r0" not in proposer._miss_streak
+
+        with patch.object(
+            proposer._ngram, "propose", return_value=[[1]]
+        ) as mock_propose:
+            drafts = proposer.propose(ctx)
+        assert drafts is not None
+        mock_propose.assert_called_once()
 
 
 if __name__ == "__main__":

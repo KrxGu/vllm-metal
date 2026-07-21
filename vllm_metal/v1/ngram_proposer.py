@@ -14,7 +14,13 @@ the runtime draft count and array arguments that upstream's stateless
 ``num_tokens_no_spec``, ``token_ids_cpu``) and hand the result back as
 :class:`DraftTokenIds`. The committed history lives in
 ``state.token_ids`` (already updated with this step's accepted/sampled tokens by
-the time the runner builds the context), so no per-request bookkeeping is needed.
+the time the runner builds the context).
+
+The one piece of per-request bookkeeping this wrapper does keep: a consecutive-
+miss streak per request, so a request with no exploitable repetition (free-form
+prose, for instance) stops paying the match kernel's per-step scan cost after
+a few misses in a row, with periodic retries in case the content turns
+repetitive later. See ``_record_miss``/``_on_cooldown``.
 
 The verify half is unchanged: drafts are handed back via ``take_draft_token_ids``
 and verified next step by ``SpeculativeDecodeController.verify_greedy``.
@@ -30,10 +36,11 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from vllm.config import VllmConfig
 
+    from vllm_metal.v1.model_runner import RequestState
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import (
         PagedDecodeSegment,
@@ -41,6 +48,18 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+# The match kernel scans a request's whole committed history every decode
+# step whether or not it finds anything -- an O(history length) Numba scan
+# plus a full-history copy into token_ids_cpu, paid regardless of outcome.
+# A request whose content has no exploitable repetition (free-form prose,
+# for instance) pays that tax every step for nothing. After this many
+# consecutive misses, stop attempting a request for _COOLDOWN_STEPS steps
+# rather than giving up on it forever -- generation can turn repetitive
+# partway through (e.g. a response that starts as prose and then quotes
+# earlier context), so a permanent cutoff would miss that.
+_MAX_CONSECUTIVE_MISSES = 8
+_COOLDOWN_STEPS = 8
 
 
 class NgramProposer:
@@ -53,6 +72,11 @@ class NgramProposer:
         controller: SpeculativeDecodeController,
     ) -> None:
         self._controller = controller
+        # Per-request consecutive-miss count and, once throttled, remaining
+        # cooldown steps before the next retry. Both pruned each step against
+        # the live request set so they never grow past what's active.
+        self._miss_streak: dict[str, int] = {}
+        self._cooldown: dict[str, int] = {}
         # Upstream reads only scalar config (prompt_lookup_min/max,
         # num_speculative_tokens, max_model_len, max_num_seqs) and runs a one-time
         # Numba JIT warmup in its constructor — keep that off the hot path.
@@ -106,6 +130,8 @@ class NgramProposer:
         if ctx.num_speculative_tokens <= 0:
             return None
 
+        self._prune_finished(ctx.request_states)
+
         drafting = list(
             self._controller.draft_eligible_requests(
                 ctx.decode_reqs,
@@ -116,6 +142,14 @@ class NgramProposer:
                 logitsprocs=ctx.logitsprocs,
             )
         )
+        if not drafting:
+            return None
+
+        drafting = [
+            (req_id, state)
+            for req_id, state in drafting
+            if not self._on_cooldown(req_id)
+        ]
         if not drafting:
             return None
 
@@ -144,7 +178,9 @@ class NgramProposer:
         draft_token_ids: list[list[int]] = []
         for (req_id, _), draft in zip(drafting, drafts, strict=True):
             if not draft:
+                self._record_miss(req_id)
                 continue
+            self._miss_streak.pop(req_id, None)
             req_ids.append(req_id)
             # Upstream already yields Python ints via ndarray.tolist() — the
             # old ``[int(t) for t in draft]`` was redundant.
@@ -154,3 +190,33 @@ class NgramProposer:
             return None
 
         return DraftTokenIds(req_ids=req_ids, draft_token_ids=draft_token_ids)
+
+    # -- miss-streak throttling ----------------------------------------------
+
+    def _on_cooldown(self, req_id: str) -> bool:
+        remaining = self._cooldown.get(req_id, 0)
+        if remaining <= 0:
+            return False
+        if remaining == 1:
+            del self._cooldown[req_id]
+        else:
+            self._cooldown[req_id] = remaining - 1
+        return True
+
+    def _record_miss(self, req_id: str) -> None:
+        streak = self._miss_streak.get(req_id, 0) + 1
+        if streak >= _MAX_CONSECUTIVE_MISSES:
+            self._cooldown[req_id] = _COOLDOWN_STEPS
+            self._miss_streak.pop(req_id, None)
+        else:
+            self._miss_streak[req_id] = streak
+
+    def _prune_finished(self, request_states: Mapping[str, RequestState]) -> None:
+        if not self._miss_streak and not self._cooldown:
+            return
+        for req_id in list(self._miss_streak):
+            if req_id not in request_states:
+                del self._miss_streak[req_id]
+        for req_id in list(self._cooldown):
+            if req_id not in request_states:
+                del self._cooldown[req_id]
