@@ -63,6 +63,7 @@ def _context(
     prefill_result_modes: list[str] | None = None,
     request_states: dict[str, SimpleNamespace] | None = None,
     num_speculative_tokens: int = 3,
+    finished_req_ids: set[str] | None = None,
 ) -> ProposeContext:
     decode_reqs = decode_reqs or []
     prefill_reqs = prefill_reqs or []
@@ -85,6 +86,7 @@ def _context(
         num_decode_segments=len(decode_reqs),
         num_speculative_tokens=num_speculative_tokens,
         logitsprocs=None,
+        finished_req_ids=finished_req_ids or set(),
     )
 
 
@@ -242,30 +244,100 @@ class TestNgramMissThrottle:
             assert proposer.propose(ctx) is None
             assert mock_propose.call_count == calls_before_throttle
 
-    def test_hit_resets_the_streak(self) -> None:
+    def test_capped_streak_returns_to_cooldown_after_one_more_miss(self) -> None:
+        """A retry that misses again right after cooldown must go straight
+        back into cooldown, not get another full _MAX_CONSECUTIVE_MISSES-long
+        grace period -- the streak caps at the threshold instead of clearing
+        when cooldown is set."""
         proposer = _proposer()
+        state = _request_state([7, 8, 9])
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        with patch.object(
+            proposer._ngram, "propose", return_value=[[]]
+        ) as mock_propose:
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
+                proposer.propose(ctx)
+            assert "r0" in proposer._cooldown
+
+            for _ in range(ngram_mod._COOLDOWN_STEPS):
+                proposer.propose(ctx)
+            calls_at_retry = mock_propose.call_count
+
+            # The retry itself misses again: this single miss must be enough
+            # to re-cooldown, not the first of another eight.
+            proposer.propose(ctx)
+            assert mock_propose.call_count == calls_at_retry + 1
+            assert "r0" in proposer._cooldown
+
+            calls_after_recooldown = mock_propose.call_count
+            proposer.propose(ctx)
+            assert mock_propose.call_count == calls_after_recooldown
+
+    def test_real_acceptance_resets_the_streak(self) -> None:
+        """A lookup match only counts once the *next* step's committed
+        history shows the target actually accepted it -- not the moment the
+        kernel proposes it."""
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
         state = _request_state([7, 8, 9])
         ctx = _context(decode_reqs=[("r0", state)])
 
         with patch.object(proposer._ngram, "propose") as mock_propose:
             mock_propose.return_value = [[]]
             for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES - 1):
-                assert proposer.propose(ctx) is None
+                proposer.propose(ctx)
+            assert "r0" not in proposer._cooldown
 
-            # A hit right before the threshold must reset the streak, not
-            # just delay the cutoff by one step.
-            mock_propose.return_value = [[1]]
-            assert proposer.propose(ctx) is not None
+            # The kernel finds something...
+            mock_propose.return_value = [[99]]
+            drafts = proposer.propose(ctx)
+            assert drafts is not None
+            # ...and the engine genuinely accepts it (appends exactly what
+            # was proposed to committed history).
+            state.token_ids.append(99)
 
+            # Resolving that acceptance must fully clear the streak, not
+            # just discount it by one.
             mock_propose.return_value = [[]]
-            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES - 1):
-                assert proposer.propose(ctx) is None
-            calls_before = mock_propose.call_count
-
-            # Still under threshold post-reset: the kernel must still be
-            # reachable, not skipped.
             proposer.propose(ctx)
-            assert mock_propose.call_count == calls_before + 1
+            assert proposer._miss_streak.get("r0", 0) <= 1
+
+    def test_lookup_match_without_acceptance_still_throttles(self) -> None:
+        """The kernel finding *something* every step isn't evidence the
+        request benefits -- if the target never actually accepts any of it,
+        this must throttle exactly like true misses would."""
+        proposer = _proposer(prompt_lookup_min=2, prompt_lookup_max=3)
+        state = _request_state([1, 2, 3, 1, 2])
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        # One resolved miss per call from the second call on (the first has
+        # nothing pending yet to resolve), so the streak needs one extra
+        # call beyond _MAX_CONSECUTIVE_MISSES to actually cross the
+        # threshold and land in cooldown.
+        with patch.object(proposer._ngram, "propose", return_value=[[99]]):
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES + 1):
+                proposer.propose(ctx)
+                # The target never agrees: the engine appends some other
+                # token instead of the proposed 99. (Once throttled, propose
+                # stops even calling the kernel, so this is a no-op then.)
+                state.token_ids.append(123)
+
+        assert "r0" in proposer._cooldown
+
+    def test_short_history_is_not_counted_as_a_miss(self) -> None:
+        """Below prompt_lookup_min, the kernel structurally cannot match --
+        that's not evidence against repetition, just not enough history yet,
+        and must never accumulate toward throttling."""
+        proposer = _proposer(prompt_lookup_min=4, prompt_lookup_max=5)
+        state = _request_state([1, 2])  # shorter than prompt_lookup_min
+        ctx = _context(decode_reqs=[("r0", state)])
+
+        with patch.object(proposer._ngram, "propose", return_value=[[]]):
+            for _ in range(2 * ngram_mod._MAX_CONSECUTIVE_MISSES):
+                assert proposer.propose(ctx) is None
+
+        assert "r0" not in proposer._cooldown
+        assert proposer._miss_streak.get("r0", 0) == 0
 
     def test_cooldown_expires_and_retries(self) -> None:
         proposer = _proposer()
@@ -303,7 +375,7 @@ class TestNgramMissThrottle:
 
         # r0 finishes: its bookkeeping must not survive to be misread by a
         # later, unrelated request that happens to reuse the same id.
-        proposer._prune_finished({})
+        proposer._prune_finished({"r0"})
         assert "r0" not in proposer._cooldown
         assert "r0" not in proposer._miss_streak
 
@@ -312,6 +384,40 @@ class TestNgramMissThrottle:
         ) as mock_propose:
             drafts = proposer.propose(ctx)
         assert drafts is not None
+        mock_propose.assert_called_once()
+
+    def test_reused_request_id_does_not_inherit_old_throttle_state(self) -> None:
+        """vLLM can hand a finished request's id straight to a brand-new
+        request in the same scheduler step. The new request is present in
+        request_states under that id from the moment it appears, so pruning
+        on absence from request_states would never catch this -- pruning
+        must key off the scheduler's own finished_req_ids instead."""
+        proposer = _proposer()
+        old_state = _request_state([7, 8, 9])
+        ctx = _context(decode_reqs=[("r0", old_state)])
+
+        with patch.object(proposer._ngram, "propose", return_value=[[]]):
+            for _ in range(ngram_mod._MAX_CONSECUTIVE_MISSES):
+                proposer.propose(ctx)
+        assert "r0" in proposer._cooldown
+
+        # Same step: r0 finishes and a brand-new request reuses the id, so
+        # it is simultaneously in finished_req_ids and in request_states.
+        new_state = _request_state([1, 2, 3])
+        new_ctx = _context(
+            decode_reqs=[("r0", new_state)],
+            finished_req_ids={"r0"},
+        )
+
+        with patch.object(
+            proposer._ngram, "propose", return_value=[[42]]
+        ) as mock_propose:
+            drafts = proposer.propose(new_ctx)
+
+        # The new request must be evaluated fresh, not skipped as if it
+        # were still the old, throttled one.
+        assert drafts is not None
+        assert drafts.req_ids == ["r0"]
         mock_propose.assert_called_once()
 
 
